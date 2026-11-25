@@ -37,7 +37,7 @@ jobs:
           python3 tool/configure_firebase.py
           python3 tool/check_identity_native.py
       - name: Cache dependency downloads
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             ~/.gradle/caches/modules-2
