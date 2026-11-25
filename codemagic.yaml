@@ -1,0 +1,31 @@
+workflows:
+  tomi-android-preview:
+    name: TOMI Android Preview
+    instance_type: mac_mini_m2
+    max_build_duration: 60
+    environment:
+      flutter: stable
+      java: 17
+    scripts:
+      - name: Generate Android scaffold without changing TOMI source
+        script: bash tool/bootstrap_android.sh
+      - name: Configure phone notifications
+        script: |
+          if [ "${TOMI_PREVIEW_MODE:-true}" = "false" ]; then export TOMI_REQUIRE_PUSH=true; fi
+          python3 tool/configure_firebase.py
+      - name: Install Flutter dependencies
+        script: flutter pub get
+      - name: Analyze Dart source
+        script: flutter analyze
+      - name: Test demo interactions and compact screens
+        script: |
+          python3 tool/check_mobile_policy.py
+          flutter test --reporter expanded
+      - name: Build preview APK
+        script: |
+          if [ -f android/app/google-services.json ]; then tomi_push_ready=true; else tomi_push_ready=false; fi
+          flutter build apk --debug --dart-define="TOMI_API_URL=${TOMI_API_URL:-}" --dart-define="TOMI_PREVIEW_MODE=${TOMI_PREVIEW_MODE:-true}" --dart-define="TOMI_PUSH_CONFIGURED=$tomi_push_ready"
+          mkdir -p output
+          cp build/app/outputs/flutter-apk/app-debug.apk output/TOMI-1.7.0-beta.1.apk
+    artifacts:
+      - output/TOMI-1.7.0-beta.1.apk

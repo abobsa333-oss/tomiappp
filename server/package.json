@@ -1,0 +1,25 @@
+{
+  "name": "tomi-accounts-api",
+  "version": "1.7.0-beta.1",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=24.0.0 <25"
+  },
+  "scripts": {
+    "start": "node src/server.mjs",
+    "test": "npm run typecheck && node tools/check_admin_build.mjs && node tools/test_runner.mjs",
+    "typecheck": "tsc --noEmit && tsc -p tsconfig.admin.json --noEmit",
+    "build:admin": "tsc -p tsconfig.admin.json"
+  },
+  "dependencies": {
+    "jose": "6.2.15",
+    "livekit-server-sdk": "2.19.1",
+    "pg": "^8.16.3",
+    "ws": "^8.18.3"
+  },
+  "devDependencies": {
+    "@types/node": "^24.19.2",
+    "typescript": "^5.9.3"
+  }
+}

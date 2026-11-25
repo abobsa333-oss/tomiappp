@@ -1,0 +1,360 @@
+name: TOMI 1.7.0-beta.1 Android
+
+"on":
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'accounts = accounts, posts, private chats and groups, voice/video calls, voice rooms and avatars; preview = design only'
+        type: choice
+        options: [accounts, preview]
+        default: accounts
+      distribution:
+        description: 'debug = private testing; signed_beta = verified APK+AAB using your existing key'
+        type: choice
+        options: [debug, signed_beta]
+        default: debug
+      api_url:
+        description: 'HTTPS server URL'
+        default: 'https://tomiapp.onrender.com'
+        type: string
+        required: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tomi-android-preview-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  accounts-api:
+    name: Test accounts, posts and database
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_DB: tomi_test
+          POSTGRES_USER: tomi_ci
+          POSTGRES_PASSWORD: ephemeral_ci_password
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - name: Download project source
+        uses: actions/checkout@v6.1.0
+        with:
+          persist-credentials: false
+      - name: Check tracked source for common credential patterns
+        run: python3 tool/check_source_secrets.py
+      - name: Set up Node 24
+        uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: server/package-lock.json
+      - name: Install backend dependencies
+        working-directory: server
+        run: npm ci --ignore-scripts --no-audit --no-fund
+      - name: Audit production backend dependencies
+        working-directory: server
+        run: npm audit --omit=dev --audit-level=high
+      - name: Install FFmpeg for real video worker tests
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ffmpeg
+      - name: Test local persistence and authentication
+        timeout-minutes: 15
+        working-directory: server
+        run: npm test
+      - name: Test real PostgreSQL integration
+        timeout-minutes: 15
+        working-directory: server
+        env:
+          TEST_DATABASE_URL: postgresql://tomi_ci:ephemeral_ci_password@localhost:5432/tomi_test
+        run: npm test
+
+      - name: Prepare PostgreSQL 17 restore-drill clients
+        env:
+          TOMI_PG_CONTAINER: ${{ job.services.postgres.id }}
+        run: python3 tool/prepare_pg_drill.py
+
+      - name: Verify encrypted backup and local PostgreSQL restore
+        timeout-minutes: 5
+        env:
+          TEST_DATABASE_URL: postgresql://tomi_ci:ephemeral_ci_password@localhost:5432/tomi_test
+        run: node server/test/pg-restore-drill.mjs
+
+  android:
+    name: Build TOMI 1.7.0-beta.1 APK
+    needs: accounts-api
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: write
+    steps:
+      - name: Download project source
+        uses: actions/checkout@v6.1.0
+        with:
+          persist-credentials: false
+
+      - name: Show source revision
+        run: git rev-parse HEAD
+
+      - name: Verify Android CI disk safeguards
+        run: |
+          python3 tool/check_android_ci.py
+          python3 tool/check_android_build_retry.py
+
+      - name: Free unused hosted-runner toolchains
+        env:
+          TOMI_CI_RUNNER_ENV: ${{ runner.environment }}
+        run: python3 tool/prepare_android_ci.py early
+
+      - name: Validate build configuration
+        env:
+          TOMI_BUILD_MODE: ${{ inputs.mode }}
+          TOMI_API_URL: ${{ inputs.api_url || vars.TOMI_API_URL || 'https://tomiapp.onrender.com' }}
+        run: python3 tool/check_build_config.py
+
+      - name: Set up Node 24 for call contract test
+        uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+
+      - name: Install API dependencies for call contract test
+        working-directory: server
+        run: npm ci --ignore-scripts --no-audit --no-fund
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Flutter stable
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          flutter-version: '3.47.7'
+          cache: true
+
+      - name: Show Flutter version
+        run: flutter --version
+
+      - name: Generate Android scaffold
+        env:
+          TOMI_FACEBOOK_APP_ID: ${{ vars.TOMI_FACEBOOK_APP_ID }}
+          TOMI_FACEBOOK_CLIENT_TOKEN: ${{ secrets.TOMI_FACEBOOK_CLIENT_TOKEN }}
+        run: bash tool/bootstrap_android.sh
+
+      - name: Cache Gradle dependency downloads
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches/modules-2
+            ~/.gradle/wrapper/dists
+          key: ${{ runner.os }}-tomi-gradle-downloads-v1-${{ hashFiles('pubspec.lock', 'tool/configure_android.py', '.github/workflows/tomi-android.yml') }}
+          restore-keys: |
+            ${{ runner.os }}-tomi-gradle-downloads-v1-
+
+      - name: Keep Flutter NDK and reserve Android build space
+        env:
+          TOMI_CI_RUNNER_ENV: ${{ runner.environment }}
+        run: python3 tool/prepare_android_ci.py android --minimum-gib 20
+
+      - name: Configure required phone notifications for accounts APK
+        env:
+          TOMI_GOOGLE_SERVICES_JSON: ${{ secrets.TOMI_GOOGLE_SERVICES_JSON }}
+          TOMI_REQUIRE_PUSH: ${{ inputs.mode == 'accounts' && 'true' || 'false' }}
+        run: python3 tool/configure_firebase.py
+
+      - name: Build and test native encryption, then Android ABIs
+        timeout-minutes: 10
+        run: |
+          rustup toolchain install 1.89.0 --profile minimal
+          cargo +1.89.0 test --locked --manifest-path packages/tomi_secure/native/Cargo.toml
+          python3 tool/build_secure_native.py --platform host
+          python3 tool/build_secure_native.py --platform android
+
+      - name: Set up CSharp game UI compiler
+        uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Build and bundle CSharp game interface
+        run: python3 tool/build_csharp_games.py
+
+      - name: Install Flutter dependencies
+        run: flutter pub get --enforce-lockfile
+
+      - name: Analyze Dart source
+        run: flutter analyze
+
+      - name: Verify Android and Firebase configuration
+        run: |
+          python3 tool/check_mobile_policy.py
+          python3 tool/check_video_trim.py
+          python3 tool/check_bootstrap.py
+          python3 tool/check_firebase.py
+
+      - name: Check release configuration safeguards
+        run: python3 tool/check_release_tools.py
+
+      - name: Test accounts, posts and compact screens
+        run: flutter test --reporter expanded
+
+      - name: Test call, room, messaging and identity controllers against the API
+        env:
+          TOMI_CALL_INTEGRATION: '1'
+          TOMI_MESSAGING_INTEGRATION: '1'
+          TOMI_IDENTITY_INTEGRATION: '1'
+          TOMI_MODERATION_INTEGRATION: '1'
+          TOMI_PRIVACY_INTEGRATION: '1'
+          TOMI_HOME_INTEGRATION: '1'
+          TOMI_CHAT_INTEGRATION: '1'
+          TOMI_GAMES_INTEGRATION: '1'
+        run: flutter test --no-pub test/call_api_integration_test.dart test/room_api_integration_test.dart test/messaging_api_integration_test.dart test/identity_api_integration_test.dart test/moderation_api_integration_test.dart test/privacy_api_integration_test.dart test/home_api_integration_test.dart test/chat12_api_integration_test.dart test/games_api_integration_test.dart --reporter expanded
+
+      - name: Check signed beta deployment and phone acceptance
+        if: inputs.distribution == 'signed_beta'
+        env:
+          TOMI_BETA_DEVICE_ACCEPTED: ${{ vars.TOMI_BETA_DEVICE_ACCEPTED }}
+        run: python3 tool/check_release_readiness.py
+
+      - name: Prepare verified signing key
+        if: inputs.distribution == 'signed_beta'
+        env:
+          TOMI_RELEASE_BUILD: '1'
+          TOMI_ANDROID_KEYSTORE_BASE64: ${{ secrets.TOMI_ANDROID_KEYSTORE_BASE64 }}
+          TOMI_ANDROID_STORE_PASSWORD: ${{ secrets.TOMI_ANDROID_STORE_PASSWORD }}
+          TOMI_ANDROID_KEY_ALIAS: ${{ secrets.TOMI_ANDROID_KEY_ALIAS }}
+          TOMI_ANDROID_KEY_PASSWORD: ${{ secrets.TOMI_ANDROID_KEY_PASSWORD }}
+          TOMI_SIGNING_CERT_SHA256: ${{ vars.TOMI_SIGNING_CERT_SHA256 }}
+        run: python3 tool/configure_release.py
+
+      - name: Build debug APK
+        if: inputs.distribution != 'signed_beta'
+        run: |
+          python3 tool/prepare_android_ci.py check --minimum-gib 20
+          python3 tool/retry_android_build.py -- flutter build apk --debug --no-pub \
+            --dart-define="TOMI_API_URL=$TOMI_API_URL" \
+            --dart-define="TOMI_PREVIEW_MODE=$TOMI_PREVIEW_MODE" \
+            --dart-define="TOMI_PUSH_CONFIGURED=$TOMI_PUSH_CONFIGURED"
+          mkdir -p output
+          cp build/app/outputs/flutter-apk/app-debug.apk output/TOMI-1.7.0-beta.1.apk
+
+      - name: Build signed beta APK and AAB
+        if: inputs.distribution == 'signed_beta'
+        env:
+          TOMI_RELEASE_BUILD: '1'
+          TOMI_ANDROID_STORE_PASSWORD: ${{ secrets.TOMI_ANDROID_STORE_PASSWORD }}
+          TOMI_ANDROID_KEY_ALIAS: ${{ secrets.TOMI_ANDROID_KEY_ALIAS }}
+          TOMI_ANDROID_KEY_PASSWORD: ${{ secrets.TOMI_ANDROID_KEY_PASSWORD }}
+        run: |
+          python3 tool/prepare_android_ci.py check --minimum-gib 20
+          python3 tool/retry_android_build.py -- flutter build apk --release --no-pub \
+            --dart-define="TOMI_API_URL=$TOMI_API_URL" \
+            --dart-define="TOMI_PREVIEW_MODE=false" \
+            --dart-define="TOMI_PUSH_CONFIGURED=$TOMI_PUSH_CONFIGURED"
+          python3 tool/prepare_android_ci.py check --minimum-gib 10
+          python3 tool/retry_android_build.py -- flutter build appbundle --release --no-pub \
+            --dart-define="TOMI_API_URL=$TOMI_API_URL" \
+            --dart-define="TOMI_PREVIEW_MODE=false" \
+            --dart-define="TOMI_PUSH_CONFIGURED=$TOMI_PUSH_CONFIGURED"
+          mkdir -p output
+          cp build/app/outputs/flutter-apk/app-release.apk output/TOMI-1.7.0-beta.1.apk
+          cp build/app/outputs/bundle/release/app-release.aab output/TOMI-1.7.0-beta.1.aab
+
+      - name: Verify release signatures and artifact hashes
+        if: inputs.distribution == 'signed_beta'
+        env:
+          TOMI_SIGNING_CERT_SHA256: ${{ vars.TOMI_SIGNING_CERT_SHA256 }}
+        run: python3 tool/check_release_artifacts.py
+
+      - name: Remove temporary signing material
+        if: always() && inputs.distribution == 'signed_beta'
+        run: python3 tool/configure_release.py --cleanup
+
+      - name: Publish verified TOMI downloads to Releases
+        timeout-minutes: 5
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TOMI_BUILD_DISTRIBUTION: ${{ inputs.distribution }}
+        run: |
+          set -euo pipefail
+          release_tag="tomi-build-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          files=(output/TOMI-1.7.0-beta.1.apk)
+          case "$TOMI_BUILD_DISTRIBUTION" in
+            debug) ;;
+            signed_beta) files+=(output/TOMI-1.7.0-beta.1.aab output/RELEASE_BUILD_INFO.json) ;;
+            *) echo "Unsupported build distribution." >&2; exit 1 ;;
+          esac
+          for file in "${files[@]}"; do
+            if [[ ! -f "$file" || -L "$file" || ! -s "$file" ]]; then
+              echo "Expected a nonempty regular build file: $file" >&2
+              exit 1
+            fi
+            if (( $(stat -c %s "$file") >= 2147483648 )); then
+              echo "Build file exceeds the Releases asset size limit: $file" >&2
+              exit 1
+            fi
+          done
+          (
+            cd output
+            sha256sum -- "${files[@]#output/}"
+          ) > output/SHA256SUMS.txt
+          files+=(output/SHA256SUMS.txt)
+          notes="$RUNNER_TEMP/tomi-release-notes.md"
+          printf 'TOMI test build\n\nDistribution: %s\nCommit: %s\nWorkflow run: %s, attempt: %s\n\nDownload the .apk under Assets. SHA256SUMS.txt records the uploaded build hashes.\n' \
+            "$TOMI_BUILD_DISTRIBUTION" "$GITHUB_SHA" "$GITHUB_RUN_NUMBER" "$GITHUB_RUN_ATTEMPT" > "$notes"
+          gh release create "$release_tag" "${files[@]}" \
+            --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
+            --title "TOMI 1.7.0-beta.1 ${TOMI_BUILD_DISTRIBUTION} build ${GITHUB_RUN_NUMBER}.${GITHUB_RUN_ATTEMPT}" \
+            --draft --prerelease --latest=false --notes-file "$notes"
+          release_id="$(gh release view "$release_tag" --repo "$GITHUB_REPOSITORY" --json databaseId --jq .databaseId)"
+          if [[ ! "$release_id" =~ ^[1-9][0-9]*$ ]]; then
+            echo "Could not resolve this draft release ID." >&2
+            exit 1
+          fi
+          gh api "repos/$GITHUB_REPOSITORY/releases/$release_id" > "$RUNNER_TEMP/tomi-release-receipt.json"
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          names = ['TOMI-1.7.0-beta.1.apk', 'SHA256SUMS.txt']
+          if os.environ['TOMI_BUILD_DISTRIBUTION'] == 'signed_beta':
+              names += ['TOMI-1.7.0-beta.1.aab', 'RELEASE_BUILD_INFO.json']
+          receipt = json.loads((Path(os.environ['RUNNER_TEMP']) / 'tomi-release-receipt.json').read_text())
+          tag = 'tomi-build-' + os.environ['GITHUB_RUN_ID'] + '-' + os.environ['GITHUB_RUN_ATTEMPT']
+          if (receipt.get('draft') is not True or receipt.get('prerelease') is not True
+                  or receipt.get('tag_name') != tag or receipt.get('target_commitish') != os.environ['GITHUB_SHA']):
+              raise SystemExit('Release does not match this verified build; left unpublished.')
+          assets = receipt.get('assets', [])
+          if len(assets) != len(names) or {a.get('name') for a in assets} != set(names):
+              raise SystemExit('Release assets are incomplete; left unpublished.')
+          for asset in assets:
+              path = Path('output') / asset['name']
+              if asset.get('state') != 'uploaded' or asset.get('size') != path.stat().st_size:
+                  raise SystemExit('Release asset upload is incomplete; left unpublished.')
+              if asset.get('digest') is not None:
+                  with path.open('rb') as stream:
+                      digest = 'sha256:' + hashlib.file_digest(stream, 'sha256').hexdigest()
+                  if asset['digest'] != digest:
+                      raise SystemExit('Release asset digest mismatch; left unpublished.')
+          print('Verified the uploaded asset names, sizes and available server digests.')
+          PY
+          gh release edit "$release_tag" --repo "$GITHUB_REPOSITORY" \
+            --draft=false --prerelease --latest=false
+          release_url="https://github.com/${GITHUB_REPOSITORY}/releases/tag/${release_tag}"
+          printf '\n### Download TOMI\n\n[Open APK/AAB downloads](%s)\n\nChoose the .apk file under Assets.\n' "$release_url" >> "$GITHUB_STEP_SUMMARY"
+          echo "TOMI download: $release_url"
+
+      - name: Report remaining build disk space
+        if: always() && hashFiles('tool/prepare_android_ci.py') != ''
+        run: python3 tool/prepare_android_ci.py report
